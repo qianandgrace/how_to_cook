@@ -4,6 +4,8 @@ pgdata2/
 # python cache
 __pycache__/
 *.pyc
+chef/
+_pdf_extract/
 
 # optional: local data
 *.log
@@ -21,3 +23,4 @@ output/
 
 # reference
 ref/
+resume.md
