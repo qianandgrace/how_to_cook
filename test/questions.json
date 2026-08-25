@@ -1,0 +1,36 @@
+{
+  "metadata": {
+    "description": "智厨 ChefBrain 问答测试集，用于对比传统RAG与GraphRAG的检索效果",
+    "created": "2026-08-25",
+    "total": 20,
+    "groups": {
+      "basic": "基础RAG问题（10道）：详细制作/推荐列表/一般问题，传统RAG可较好覆盖",
+      "multi_hop": "多跳关联问题（5道）：需要跨文档实体关系推理，预期GraphRAG更有优势",
+      "complex": "复杂约束问题（5道）：多条件组合查询，预期GraphRAG更有优势"
+    }
+  },
+  "questions": [
+    {"id": "A1", "group": "basic", "category": "detail", "question": "麻婆豆腐怎么做？"},
+    {"id": "A2", "group": "basic", "category": "detail", "question": "红烧肉的制作步骤是什么？"},
+    {"id": "A3", "group": "basic", "category": "detail", "question": "可乐鸡翅需要哪些食材？"},
+    {"id": "A4", "group": "basic", "category": "list", "question": "推荐几个素菜"},
+    {"id": "A5", "group": "basic", "category": "list", "question": "推荐几个川菜"},
+    {"id": "A6", "group": "basic", "category": "list", "question": "推荐几个简单的早餐"},
+    {"id": "A7", "group": "basic", "category": "general", "question": "什么是川菜？"},
+    {"id": "A8", "group": "basic", "category": "general", "question": "炒菜不粘锅有什么技巧？"},
+    {"id": "A9", "group": "basic", "category": "general", "question": "鸡蛋的营养价值有哪些？"},
+    {"id": "A10", "group": "basic", "category": "general", "question": "糖醋汁怎么调制？"},
+
+    {"id": "B1", "group": "multi_hop", "category": "multi_hop", "question": "减肥期间适合吃什么菜？"},
+    {"id": "B2", "group": "multi_hop", "category": "multi_hop", "question": "鸡肉和什么蔬菜搭配比较好？"},
+    {"id": "B3", "group": "multi_hop", "category": "multi_hop", "question": "什么食材可以替代猪肉？"},
+    {"id": "B4", "group": "multi_hop", "category": "multi_hop", "question": "想补充蛋白质应该吃哪些菜？"},
+    {"id": "B5", "group": "multi_hop", "category": "multi_hop", "question": "夏天吃什么菜比较开胃？"},
+
+    {"id": "C1", "group": "complex", "category": "complex", "question": "适合糖尿病人吃的低糖川菜有哪些，并且制作时间不超过30分钟？"},
+    {"id": "C2", "group": "complex", "category": "complex", "question": "如果我只有鸡肉和蔬菜，能做什么菜，最好是不同菜系的？"},
+    {"id": "C3", "group": "complex", "category": "complex", "question": "哪些菜可以用豆腐替代肉类，并且保持相似的口感？"},
+    {"id": "C4", "group": "complex", "category": "complex", "question": "想做一道少油、不放辣椒、适合老人小孩的荤菜，有什么推荐？"},
+    {"id": "C5", "group": "complex", "category": "complex", "question": "有哪些菜用到的食材在冰箱里很常见（鸡蛋、土豆、青菜），而且20分钟内能完成？"}
+  ]
+}
