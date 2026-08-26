@@ -12,6 +12,7 @@
 """
 import json
 import sys
+import time
 import argparse
 from pathlib import Path
 
@@ -94,6 +95,7 @@ def main():
     parser = argparse.ArgumentParser(description="在GraphRAG上运行测试集")
     parser.add_argument("--only", nargs="*", default=None, help="只运行指定题目id，如 A1 B2")
     parser.add_argument("--append", action="store_true", help="追加/合并到已有结果文件（断点续跑）")
+    parser.add_argument("--force", action="store_true", help="强制重跑（即使结果已存在）")
     args = parser.parse_args()
 
     test_dir = Path(__file__).resolve().parent / "test"
@@ -114,10 +116,11 @@ def main():
     if args.append and out_path.exists():
         existing = json.load(open(out_path, encoding="utf-8"))
         results_by_id = {r["id"]: r for r in existing["results"]}
-        skip = [it["id"] for it in items if it["id"] in results_by_id and "error" not in results_by_id[it["id"]]]
-        if skip:
-            print(f"跳过已完成的题目: {skip}")
-            items = [it for it in items if it["id"] not in results_by_id or "error" in results_by_id[it["id"]]]
+        if not args.force:
+            skip = [it["id"] for it in items if it["id"] in results_by_id and "error" not in results_by_id[it["id"]]]
+            if skip:
+                print(f"跳过已完成的题目: {skip}")
+                items = [it for it in items if it["id"] not in results_by_id or "error" in results_by_id[it["id"]]]
 
     print("初始化GraphRAG系统...")
     rag = AdvancedGraphRAGSystem()
@@ -128,13 +131,15 @@ def main():
         qid = item["id"]
         q = item["question"]
         print(f"\n[{idx}/{len(items)}] {qid} [{item['group']}] {q}", flush=True)
+        t0 = time.time()
         try:
             r = run_single(rag, q)
             r["id"] = qid
             r["group"] = item["group"]
             r["category"] = item["category"]
+            r["elapsed_sec"] = round(time.time() - t0, 1)
             results_by_id[qid] = r
-            print(f"  策略={r['strategy']} 复杂度={r.get('query_complexity')} 检索到={r['retrieved_documents']}", flush=True)
+            print(f"  策略={r['strategy']} 复杂度={r.get('query_complexity')} 耗时={r['elapsed_sec']}s 检索到={r['retrieved_documents']}", flush=True)
         except Exception as e:
             print(f"  出错: {e}", flush=True)
             results_by_id[qid] = {"id": qid, "question": q, "group": item["group"], "error": str(e)}

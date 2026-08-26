@@ -297,11 +297,7 @@ class AdvancedGraphRAGSystem:
         except Exception as e:
             logger.error(f"问答处理失败: {e}")
             return f"抱歉，处理问题时出现错误：{str(e)}", None
-    
 
-    
-
-    
     def run_interactive(self):
         """运行交互式问答"""
         if not self.system_ready:

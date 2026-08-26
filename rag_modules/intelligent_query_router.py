@@ -202,40 +202,66 @@ class IntelligentQueryRouter:
             reasoning="基于规则的简单分析"
         )
     
+    def _deterministic_strategy(self, analysis: QueryAnalysis) -> SearchStrategy:
+        """
+        确定性路由规则（覆盖LLM的recommended_strategy）：
+          简单问题（得分 < hybrid_threshold）→ 传统混合检索 hybrid_search
+          中等问题（hybrid_threshold <= 得分 < graph_threshold）→ 组合检索（图+混合）
+          困难问题（得分 >= graph_threshold）→ 组合检索（图+混合，复杂约束侧重图）
+        得分 = max(查询复杂度, 关系密集度)
+
+        说明：实测纯 graph_rag_search 对"减肥/替代猪肉"等主题型中等问题召回偏弱
+        （子图为空 / 实体映射不准，且多跳可能卡死），因此中等及以上统一走 combined，
+        让图信号(多跳/子图/实体)与混合信号(dual_level+向量)相互兜底。
+        """
+        score = max(analysis.query_complexity, analysis.relationship_intensity)
+        hybrid_th = float(getattr(self.config, 'hybrid_threshold', 0.4))
+        graph_th = float(getattr(self.config, 'graph_threshold', 0.6))
+        if score < hybrid_th:
+            return SearchStrategy.HYBRID_TRADITIONAL
+        return SearchStrategy.COMBINED
+
     def route_query(self, query: str, top_k: int = 5) -> Tuple[List[Document], QueryAnalysis]:
         """
         智能路由查询到最适合的检索引擎
         """
         logger.info(f"开始智能路由: {query}")
-        
-        # 1. 分析查询特征
+
+        # 1. 分析查询特征（LLM给出四维得分）
         analysis = self.analyze_query(query)
-        
-        # 2. 更新统计
+
+        # 2. 用确定性分层规则覆盖LLM推荐策略：简单→hybrid / 中等→图RAG / 难→combined
+        analysis.recommended_strategy = self._deterministic_strategy(analysis)
+
+        # 3. 更新统计
         self._update_route_stats(analysis.recommended_strategy)
-        
-        # 3. 根据策略执行检索
+
+        # 4. 根据策略执行检索
         documents = []
-        
+
         try:
             if analysis.recommended_strategy == SearchStrategy.HYBRID_TRADITIONAL:
                 logger.info("使用传统混合检索")
                 documents = self.traditional_retrieval.hybrid_search(query, top_k)
-                
+
             elif analysis.recommended_strategy == SearchStrategy.GRAPH_RAG:
                 logger.info("🕸️ 使用图RAG检索")
                 documents = self.graph_rag_retrieval.graph_rag_search(query, top_k)
-                
+                # 图检索无结果时降级到传统混合检索保底
+                if not documents:
+                    logger.warning("图RAG未返回结果，降级到传统混合检索")
+                    documents = self.traditional_retrieval.hybrid_search(query, top_k)
+
             elif analysis.recommended_strategy == SearchStrategy.COMBINED:
                 logger.info("🔄 使用组合检索策略")
                 documents = self._combined_search(query, top_k)
-            
-            # 4. 结果后处理
+
+            # 5. 结果后处理
             documents = self._post_process_results(documents, analysis)
-            
+
             logger.info(f"路由完成，返回 {len(documents)} 个结果")
             return documents, analysis
-            
+
         except Exception as e:
             logger.error(f"查询路由失败: {e}")
             # 降级到传统检索
@@ -322,24 +348,25 @@ class IntelligentQueryRouter:
     def explain_routing_decision(self, query: str) -> str:
         """解释路由决策过程"""
         analysis = self.analyze_query(query)
-        
+        strategy = self._deterministic_strategy(analysis)
+
         explanation = f"""
         查询路由分析报告
-        
+
         查询：{query}
-        
+
         特征分析：
         - 复杂度：{analysis.query_complexity:.2f} ({'简单' if analysis.query_complexity < 0.4 else '中等' if analysis.query_complexity < 0.8 else '复杂'})
         - 关系密集度：{analysis.relationship_intensity:.2f} ({'单一实体' if analysis.relationship_intensity < 0.4 else '实体关系' if analysis.relationship_intensity < 0.8 else '复杂关系网络'})
         - 推理需求：{'是' if analysis.reasoning_required else '否'}
         - 实体数量：{analysis.entity_count}
-        
-        推荐策略：{analysis.recommended_strategy.value}
+
+        推荐策略：{strategy.value}
         置信度：{analysis.confidence:.2f}
-        
+
         决策理由：{analysis.reasoning}
         """
-        
+
         return explanation
 
  

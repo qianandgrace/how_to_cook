@@ -38,6 +38,10 @@ class GraphRAGConfig:
     chunk_overlap: int = 50
     max_graph_depth: int = 2  # 图遍历最大深度
 
+    # 智能路由确定性规则阈值（得分 = max(查询复杂度, 关系密集度)）
+    hybrid_threshold: float = 0.4  # 得分 < 此值 → 传统混合检索（简单问题）
+    graph_threshold: float = 0.6   # 得分 < 此值 → 图RAG检索（中等问题），否则组合检索（难问题）
+
     def __post_init__(self):
         """初始化后的处理"""
         # LightRAG使用Round-robin策略，无需权重验证

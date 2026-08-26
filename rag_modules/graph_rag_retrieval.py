@@ -326,7 +326,7 @@ class GraphRAGRetrieval:
                     if target_keywords:
                         params["target_keywords"] = target_keywords
                     
-                    result = session.run(cypher_query, params)
+                    result = session.run(cypher_query, params, timeout=20.0)
                     
                     for record in result:
                         path_data = self._parse_neo4j_path(record)
@@ -393,7 +393,7 @@ class GraphRAGRetrieval:
                 result = session.run(cypher_query, {
                     "source_entities": graph_query.source_entities,
                     "max_nodes": graph_query.max_nodes
-                })
+                }, timeout=20.0)
                 
                 record = result.single()
                 if record:
