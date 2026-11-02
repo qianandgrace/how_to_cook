@@ -147,7 +147,12 @@ def continue_processing(recipe_dir: str, output_dir: str):
     try:
         ai_agent = RecipeAgent(api_key, llm_cfg["base_url"], llm_cfg["model"])
         batch_size = config.get("processing", {}).get("batch_size", 20)
-        builder = RecipeKnowledgeGraphBuilder(ai_agent, output_dir, batch_size)
+        use_llm = config.get("processing", {}).get("use_llm", False)
+        llm_batch_size = config.get("processing", {}).get("llm_batch_size", 8)
+        builder = RecipeKnowledgeGraphBuilder(
+            ai_agent, output_dir, batch_size,
+            use_llm=use_llm, llm_batch_size=llm_batch_size,
+        )
         
         print("继续处理中断的任务...")
         processed, failed = builder.batch_process_recipes(recipe_dir, resume=True)

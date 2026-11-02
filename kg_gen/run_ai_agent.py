@@ -108,7 +108,11 @@ def main():
     """主函数"""
     print("🍳 AI菜谱知识图谱生成器")
     print("=" * 50)
-    
+
+    # 支持 --no-llm：纯规则零成本运行（忽略 config 里的 use_llm）
+    no_llm = "--no-llm" in sys.argv
+    sys.argv = [a for a in sys.argv if a != "--no-llm"]
+
     # 检查是否为测试模式
     if len(sys.argv) > 1 and sys.argv[1] == "test":
         success = test_single_recipe()
@@ -145,7 +149,12 @@ def main():
         # 创建知识图谱构建器
         output_dir = config["output"].get("directory", "./ai_output")
         batch_size = config.get("processing", {}).get("batch_size", 20)  # 默认批次大小为20
-        builder = RecipeKnowledgeGraphBuilder(ai_agent, output_dir, batch_size)
+        use_llm = (not no_llm) and config.get("processing", {}).get("use_llm", False)
+        llm_batch_size = config.get("processing", {}).get("llm_batch_size", 8)
+        builder = RecipeKnowledgeGraphBuilder(
+            ai_agent, output_dir, batch_size,
+            use_llm=use_llm, llm_batch_size=llm_batch_size,
+        )
         
         # 批量处理菜谱
         print(f"\n📚 开始处理菜谱目录...")

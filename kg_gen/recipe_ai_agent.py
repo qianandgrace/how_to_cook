@@ -7,6 +7,8 @@
 import os
 import json
 import re
+import ast
+import unicodedata
 import time
 from openai import OpenAI
 from typing import Dict, List, Optional, Tuple
@@ -14,6 +16,7 @@ from dataclasses import dataclass, asdict
 import pandas as pd
 import csv
 from datetime import datetime
+from rule_parser import RuleRecipeParser
 
 @dataclass
 class IngredientInfo:
@@ -107,7 +110,15 @@ class RecipeAgent:
         
         # 预定义的工具
         self.cooking_tools = ["炒锅", "平底锅", "蒸锅", "刀", "案板", "筷子", "锅铲", "勺子"]
-    
+
+        # 规则优先解析器（零 LLM 成本），复用上面的词典
+        self.rule_parser = RuleRecipeParser(
+            directory_category_mapping=self.directory_category_mapping,
+            ingredient_categories=self.ingredient_categories,
+            cooking_methods=self.cooking_methods,
+            cooking_tools=self.cooking_tools,
+        )
+
     def call_llm_api(self, messages: List[Dict], max_retries: int = 3) -> str:
         """调用LLM API"""
         for attempt in range(max_retries):
@@ -139,148 +150,104 @@ class RecipeAgent:
         
         return ""  # 如果无法推断，返回空字符串
     
-    def extract_recipe_info(self, markdown_content: str, file_path: str = "") -> RecipeInfo:
-        """使用AI提取菜谱信息"""
-        
-        # 根据路径推断分类
-        inferred_category = self.infer_category_from_path(file_path)
-        
-        # 构建提示词
-        category_hint = f"，根据文件路径推断此菜谱属于【{inferred_category}】分类" if inferred_category else ""
-        
-        prompt = f"""
-请分析以下标准化格式的菜谱Markdown文档，提取结构化信息并以JSON格式返回。
+    def extract_recipe_info(self, markdown_content: str, file_path: str = "", use_llm: bool = False) -> RecipeInfo:
+        """解析菜谱信息：规则优先，可选单份 LLM 补漏（默认关闭，零成本）。"""
+        info = self.extract_recipe_info_rule(markdown_content, file_path)
+        if use_llm:
+            try:
+                infos = self.refine_recipe_info_batch([info])
+                if infos:
+                    info = infos[0]
+            except Exception as e:
+                print(f"LLM 补漏失败，使用规则结果: {e}")
+        return info
 
-文件路径: {file_path}
-菜谱内容：
-{markdown_content}
+    def extract_recipe_info_rule(self, markdown_content: str, file_path: str = "") -> RecipeInfo:
+        """纯规则解析菜谱（零 LLM 调用），异常时回退到备用解析。"""
+        try:
+            return self.rule_parser.parse(markdown_content, file_path)
+        except Exception as e:
+            print(f"规则解析失败，回退备用解析: {e}")
+            return self._fallback_parse(markdown_content)
 
-## 文档结构说明
-此菜谱遵循标准格式，包含以下固定二级标题：
-- ## 必备原料和工具：列出所有食材和工具
-- ## 计算：包含份量计算和具体用量
-- ## 操作：详细的烹饪步骤
-- ## 附加内容：补充说明和技巧提示（需要过滤无关内容）
+    def refine_recipe_info_batch(self, recipe_infos: List[RecipeInfo]) -> List[RecipeInfo]:
+        """对一批菜谱做 LLM 补漏：只补 cuisine_type / 空的时间字段 / 未分类食材。
 
-## 提取规则
-1. **菜谱名称**：从一级标题（# XXX的做法）提取
-2. **难度等级**：从"预估烹饪难度：★★★"中统计★的数量
-3. **菜谱分类**：可以是多个分类，用逗号分隔（如"早餐,素菜"表示既是早餐又是素菜）
-4. **食材信息**：从"必备原料和工具"和"计算"部分提取，合并用量信息
-5. **烹饪步骤**：从"操作"部分的有序列表提取
-6. **技巧补充**：从"附加内容"提取有用的烹饪技巧，忽略模板文字（如"如果您遵循本指南...Issue或Pull request"等）
+        精简提示词：只发菜名 + 食材名 + 缺失字段标记，不发整份菜谱、不产出 nutrition。
+        任何异常直接返回原列表（不重试烧钱）。
+        """
+        candidates = []
+        for i, info in enumerate(recipe_infos):
+            uncategorized = [ing.name for ing in info.ingredients
+                             if not ing.category or ing.category == "其他"]
+            if (not info.cuisine_type or not info.cook_time or not info.prep_time
+                    or uncategorized):
+                candidates.append({
+                    "index": i,
+                    "name": info.name,
+                    "cuisine_type": info.cuisine_type,
+                    "prep_time": info.prep_time,
+                    "cook_time": info.cook_time,
+                    "ingredients": [{"name": n} for n in uncategorized],
+                })
 
-请返回标准JSON格式{category_hint}：
-{{
-    "name": "菜谱名称（去掉'的做法'后缀）",
-    "difficulty": 1-5的数字（根据★数量：★=1, ★★=2, ★★★=3, ★★★★=4, ★★★★★=5），
-    "category": "{inferred_category if inferred_category else '菜谱分类（素菜/荤菜/水产/早餐/主食/汤类/甜品/饮料/调料，支持多个分类用逗号分隔，如\"早餐,素菜\"）'}",
-    "cuisine_type": "菜系（川菜/粤菜/鲁菜/苏菜/闽菜/浙菜/湘菜/徽菜/东北菜/西北菜/等，如果不明确则为空）",
-    "prep_time": "准备时间（从腌制、切菜等步骤推断）",
-    "cook_time": "烹饪时间（从炒制、炖煮等步骤推断）", 
-    "servings": "份数/人数（从'计算'部分提取，如'2个人食用'）",
-    "ingredients": [
-        {{
-            "name": "食材名称",
-            "amount": "用量数字（从计算部分提取具体数值）",
-            "unit": "单位（克、个、毫升、片等）",
-            "category": "食材类别（蔬菜/调料/蛋白质/淀粉类/其他）",
-            "is_main": true/false（主要食材为true，调料为false）
-        }}
-    ],
-    "steps": [
-        {{
-            "step_number": 1,
-            "description": "步骤详细描述",
-            "methods": ["使用的烹饪方法：炒、炸、煮、蒸、烤、炖、焖、煎、红烧、腌制、切等"],
-            "tools": ["需要的工具：炒锅、平底锅、蒸锅、刀、案板、筷子、锅铲、盆等"],
-            "time_estimate": "时间估计（如步骤中提到'15秒'、'30秒'、'10-15分钟'等）"
-        }}
-    ],
-    "tags": ["从附加内容中提取的有用技巧标签"],
-    "nutrition_info": {{
-        "calories": "",
-        "protein": "", 
-        "carbs": "",
-        "fat": ""
-    }}
-}}
+        if not candidates:
+            return recipe_infos
 
-## 重要提示：
-1. 从"计算"部分精确提取食材用量和单位
-2. 从"操作"部分的有序列表逐步解析烹饪步骤
-3. 从"附加内容"中只提取烹饪技巧，忽略"Issue或Pull request"等模板文字
-4. 食材分类要准确：蔬菜（包括各种菜类）、调料（盐、酱油、糖等）、蛋白质（鱼、肉、蛋）、淀粉类（面粉、米等）
-5. 菜谱分类支持多重分类：如早餐类的蔬菜粥可以分类为"早餐,素菜,主食"（逗号分隔）
-6. 当遇到"适量"、"少许"等非具体数值时，不要忘记加引号，如"amount": "适量"
-7. 只返回标准JSON格式，确保语法正确
-"""
-
+        prompt = (
+            "请补全以下菜谱中缺失的字段（值为空即缺失）。"
+            "只补缺失字段，不要改动已有内容，不要新增字段。"
+            "ingredients 里列出的是分类缺失的食材，请为每一项给出 category（蔬菜/调料/蛋白质/淀粉类/其他）。"
+            "返回 JSON 对象 {\"results\": [...]}，与输入数组一一对应，只含补全后的字段。\n\n"
+            f"输入：\n{json.dumps(candidates, ensure_ascii=False)}"
+        )
         messages = [
-            {"role": "system", "content": "你是一个专业的菜谱分析专家，擅长从中文菜谱中提取结构化信息。"},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": "你是中文菜谱数据补全助手，只输出合法 JSON。"},
+            {"role": "user", "content": prompt},
         ]
-        
+
         try:
             response = self.call_llm_api(messages)
-            
-            # 清理响应，确保是有效的JSON
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            if response.endswith("```"):
-                response = response[:-3]
-            response = response.strip()
-            
-            # 解析JSON
-            recipe_data = json.loads(response)
-            
-            # 转换为RecipeInfo对象
-            recipe_info = RecipeInfo(
-                name=recipe_data.get("name", ""),
-                difficulty=recipe_data.get("difficulty", 3),
-                category=recipe_data.get("category", ""),
-                cuisine_type=recipe_data.get("cuisine_type", ""),
-                prep_time=recipe_data.get("prep_time", ""),
-                cook_time=recipe_data.get("cook_time", ""),
-                servings=recipe_data.get("servings", ""),
-                nutrition_info=recipe_data.get("nutrition_info", {})
-            )
-            
-            # 转换食材信息
-            for ing_data in recipe_data.get("ingredients", []):
-                ingredient = IngredientInfo(
-                    name=ing_data.get("name", ""),
-                    amount=ing_data.get("amount", ""),
-                    unit=ing_data.get("unit", ""),
-                    category=ing_data.get("category", ""),
-                    is_main=ing_data.get("is_main", True)
-                )
-                recipe_info.ingredients.append(ingredient)
-            
-            # 转换步骤信息
-            for step_data in recipe_data.get("steps", []):
-                step = CookingStep(
-                    step_number=step_data.get("step_number", 0),
-                    description=step_data.get("description", ""),
-                    methods=step_data.get("methods", []),
-                    tools=step_data.get("tools", []),
-                    time_estimate=step_data.get("time_estimate", "")
-                )
-                recipe_info.steps.append(step)
-            
-            # 添加标签
-            recipe_info.tags = recipe_data.get("tags", [])
-            
-            return recipe_info
-            
-        except json.JSONDecodeError as e:
-            print(f"JSON解析错误: {e}")
-            print(f"原始响应: {response}")
-            return self._fallback_parse(markdown_content)
+            data = json.loads(self._strip_json_fence(response))
+            results = data.get("results", data) if isinstance(data, dict) else data
+            if not isinstance(results, list):
+                return recipe_infos
+
+            result_map = {r.get("index"): r for r in results if isinstance(r, dict) and "index" in r}
+            for i, info in enumerate(recipe_infos):
+                r = result_map.get(i)
+                if not r:
+                    continue
+                if r.get("cuisine_type"):
+                    info.cuisine_type = r["cuisine_type"]
+                if r.get("prep_time"):
+                    info.prep_time = r["prep_time"]
+                if r.get("cook_time"):
+                    info.cook_time = r["cook_time"]
+                for ing_item in r.get("ingredients", []):
+                    if not isinstance(ing_item, dict):
+                        continue
+                    new_cat = ing_item.get("category")
+                    if not new_cat:
+                        continue
+                    for ing in info.ingredients:
+                        if ing.name == ing_item.get("name"):
+                            ing.category = new_cat
+                            if new_cat == "调料":
+                                ing.is_main = False
+                            break
+            return recipe_infos
         except Exception as e:
-            print(f"AI解析错误: {e}")
-            return self._fallback_parse(markdown_content)
+            print(f"LLM 补漏失败，保留规则结果: {e}")
+            return recipe_infos
+
+    def _strip_json_fence(self, response: str) -> str:
+        """去掉 LLM 返回内容中的 ```json 围栏。"""
+        text = response.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text).rstrip("`").strip()
+        return text
+
     
     def _fallback_parse(self, content: str) -> RecipeInfo:
         """备用解析方法（基于规则）"""
@@ -316,14 +283,39 @@ class RecipeAgent:
 
 class RecipeKnowledgeGraphBuilder:
     """菜谱知识图谱构建器 - 支持分批保存和断点续传"""
-    
-    def __init__(self, ai_agent: RecipeAgent, output_dir: str = "./ai_output", batch_size: int = 20):
+
+    # 食材别名 -> 规范名。合并写法不同、实质同一的食材（避免马铃薯/土豆两节点）。
+    # 只放语义无争议的；老抽/生抽、大葱/小葱这类烹饪意义不同的绝不合并。
+    INGREDIENT_NAME_ALIASES = {
+        "白砂糖": "白糖", "绵白糖": "白糖", "细砂糖": "白糖",
+        "马铃薯": "土豆", "洋芋": "土豆", "地蛋": "土豆",
+        "西红柿": "番茄", "洋柿子": "番茄",
+        "地瓜": "红薯", "甘薯": "红薯", "山芋": "红薯",
+        "生姜": "姜",
+        "大料": "八角",
+        "芫荽": "香菜", "胡荽": "香菜",
+        "冬菇": "香菇", "花菇": "香菇",
+        "黑木耳": "木耳",
+        "黄酒": "料酒", "绍兴酒": "料酒",
+        "食用油": "油",
+        "芝麻油": "香油",
+        "香葱": "小葱", "细葱": "小葱",
+        "鸡子": "鸡蛋",
+        "生粉": "淀粉",
+    }
+
+    def __init__(self, ai_agent: RecipeAgent, output_dir: str = "./ai_output", batch_size: int = 20,
+                 use_llm: bool = False, llm_batch_size: int = 8):
         self.ai_agent = ai_agent
         self.concepts = []
         self.relationships = []
+        self._ingredient_ids_by_name = {}   # 规范食材名 -> concept_id，跨菜谱复用食材节点（去重）
+        self._concept_by_id = {}            # concept_id -> 概念 dict，用于给共享节点补别名
         self.concept_id_counter = 201000000
         self.output_dir = output_dir
         self.batch_size = batch_size
+        self.use_llm = use_llm          # 是否启用 LLM 补漏（默认 False = 纯规则零成本）
+        self.llm_batch_size = llm_batch_size  # LLM 补漏每批菜谱数
         self.progress_file = os.path.join(output_dir, "progress.json")
         self.processed_files = set()
         self.current_batch = 0
@@ -523,13 +515,94 @@ class RecipeKnowledgeGraphBuilder:
                 self.processed_files = set(progress_data.get("processed_files", []))
                 self.current_batch = progress_data.get("current_batch", 0)
                 self.concept_id_counter = progress_data.get("concept_id_counter", 201000000)
-                
+
+                # 断点续传后重建食材去重索引，避免已处理批次的食材被重复创建
+                self._rebuild_entity_index_from_batches()
+
                 return progress_data
             except Exception as e:
                 print(f"警告: 加载进度文件失败 - {str(e)}")
                 return {}
         return {}
-    
+
+    def _rebuild_entity_index_from_batches(self):
+        """从已保存的批次 concepts.csv 重建食材去重索引。
+
+        断点续传时内存中没有历史概念，靠它恢复 '规范食材名 -> ID'，
+        保证续传后新菜谱仍能复用旧食材节点。
+        """
+        self._ingredient_ids_by_name = {}
+        self._concept_by_id = {}
+        batch_dirs = [d for d in os.listdir(self.output_dir)
+                      if d.startswith("batch_") and os.path.isdir(os.path.join(self.output_dir, d))]
+        for batch_dir in sorted(batch_dirs):
+            concepts_file = os.path.join(self.output_dir, batch_dir, "concepts.csv")
+            if not os.path.exists(concepts_file):
+                continue
+            try:
+                df = pd.read_csv(concepts_file)
+            except Exception:
+                continue
+            for _, row in df.iterrows():
+                if row.get("concept_type") != "Ingredient" or not row.get("name"):
+                    continue
+                # CSV 里 concept_id 会被 pandas 解析成 int，统一转回 str 与内存格式一致
+                cid = str(row["concept_id"])
+                canon = self._normalize_ingredient_name(row["name"])
+                self._ingredient_ids_by_name.setdefault(canon, cid)
+                self._concept_by_id.setdefault(cid, {
+                    "concept_id": cid,
+                    "concept_type": "Ingredient",
+                    "name": row["name"],
+                    "synonyms": self._parse_synonyms(row.get("synonyms")),
+                })
+
+    @staticmethod
+    def _normalize_ingredient_name(name: str) -> str:
+        """食材名归一化（幂等）：文本清理 + 别名映射到规范名。
+
+        - NFKC：全角 -> 半角、全角空格/括号归一
+        - 折叠内部空白、去掉常见备注后缀
+        - 查 INGREDIENT_NAME_ALIASES 映射到规范名
+        """
+        if not name:
+            return name
+        s = unicodedata.normalize("NFKC", str(name)).strip()
+        s = re.sub(r"\s+", " ", s)
+        s = s.translate(str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"))
+        # NFKC 已把全角括号转半角，故同时匹配两种形式
+        for suffix in ("（可选）", "(可选)", "（随意）", "(随意)", "（可不放）", "(可不放)", "（optional）", "(optional)"):
+            if s.endswith(suffix):
+                s = s[:-len(suffix)].strip()
+        return RecipeKnowledgeGraphBuilder.INGREDIENT_NAME_ALIASES.get(s, s)
+
+    @staticmethod
+    def _parse_synonyms(value) -> List[dict]:
+        """把批次 CSV 里存过的同义词（list 的 repr 字符串）解析回 list-of-dict。"""
+        if isinstance(value, list):
+            return [s for s in value if isinstance(s, dict)]
+        if not value:
+            return []
+        try:
+            parsed = ast.literal_eval(value)
+        except Exception:
+            return []
+        if isinstance(parsed, list):
+            return [s for s in parsed if isinstance(s, dict)]
+        return []
+
+    def _add_synonym(self, synonyms: List[dict], term: str) -> List[dict]:
+        """把别名 term 补进同义词列表（已存在则不动），供规范化后保留原名。"""
+        syns = [s for s in (synonyms or []) if isinstance(s, dict)]
+        if any(s.get("term") == term for s in syns):
+            return syns
+        lang = "en" if self._is_english(term) else "zh"
+        return syns + [{
+            "term": term,
+            "language": lang,
+            "language_code": "en-US" if lang == "en" else "zh-CN",
+        }]
+
     def save_batch_data(self, batch_num: int = None):
         """保存当前批次数据"""
         if batch_num is None:
@@ -602,12 +675,14 @@ class RecipeKnowledgeGraphBuilder:
         return str(self.concept_id_counter)
     
     def process_recipe(self, markdown_content: str, file_path: str) -> Dict:
-        """处理单个菜谱"""
-        # 处理菜谱
-        
-        # 使用AI提取菜谱信息
-        recipe_info = self.ai_agent.extract_recipe_info(markdown_content, file_path)
-        
+        """处理单个菜谱：规则解析（可选单份 LLM 补漏）→ 构建图谱。"""
+        recipe_info = self.ai_agent.extract_recipe_info(
+            markdown_content, file_path, use_llm=self.use_llm
+        )
+        return self.build_graph(recipe_info, file_path)
+
+    def build_graph(self, recipe_info: RecipeInfo, file_path: str) -> Dict:
+        """从 RecipeInfo 构建图节点与关系（纯规则，零 LLM 调用）。"""
         # 生成概念ID
         recipe_id = self.generate_concept_id()
         
@@ -633,22 +708,37 @@ class RecipeKnowledgeGraphBuilder:
         
         # 处理食材
         for ingredient in recipe_info.ingredients:
-            ing_id = self.generate_concept_id()
-            ing_concept = {
-                "concept_id": ing_id,
-                "concept_type": "Ingredient",
-                "name": ingredient.name,
-                "fsn": f"{ingredient.name} (Ingredient)",
-                "preferred_term": ingredient.name,
-                "synonyms": self._generate_ingredient_synonyms(ingredient.name),
-                "category": ingredient.category,
-                "amount": ingredient.amount,
-                "unit": ingredient.unit,
-                "is_main": ingredient.is_main
-            }
-            self.concepts.append(ing_concept)
-            
-            # 添加关系：菜谱包含食材
+            raw_name = ingredient.name
+            canon_name = self._normalize_ingredient_name(raw_name)
+            # 跨菜谱按规范名复用食材节点（同一食材只建一个概念）
+            ing_id = self._ingredient_ids_by_name.get(canon_name)
+            if ing_id is None:
+                ing_id = self.generate_concept_id()
+                self._ingredient_ids_by_name[canon_name] = ing_id
+                ing_concept = {
+                    "concept_id": ing_id,
+                    "concept_type": "Ingredient",
+                    "name": canon_name,
+                    "fsn": f"{canon_name} (Ingredient)",
+                    "preferred_term": canon_name,
+                    "synonyms": self._generate_ingredient_synonyms(canon_name),
+                    "category": ingredient.category,
+                    "amount": ingredient.amount,
+                    "unit": ingredient.unit,
+                    "is_main": ingredient.is_main
+                }
+                # 归一化后原名变成别名（如 马铃薯 -> 土豆，马铃薯保留进同义词）
+                if canon_name != raw_name:
+                    ing_concept["synonyms"] = self._add_synonym(ing_concept["synonyms"], raw_name)
+                self._concept_by_id[ing_id] = ing_concept
+                self.concepts.append(ing_concept)
+            elif canon_name != raw_name:
+                # 复用：本次出现的新别名补进共享节点，保证别名在查询侧可命中
+                node = self._concept_by_id.get(ing_id)
+                if node is not None:
+                    node["synonyms"] = self._add_synonym(node.get("synonyms") or [], raw_name)
+
+            # 添加关系：菜谱包含食材（单菜谱的用量挂在关系上，共享节点不覆盖）
             self.relationships.append({
                 "relationship_id": f"R_{len(self.relationships) + 1:06d}",
                 "source_id": recipe_id,
@@ -922,9 +1012,13 @@ class RecipeKnowledgeGraphBuilder:
         return self._categorize_synonyms_by_language(synonyms)
     
     def batch_process_recipes(self, recipe_dir: str, resume: bool = True) -> Tuple[int, int]:
-        """批量处理菜谱目录 - 支持断点续传和分批保存"""
+        """批量处理菜谱目录 - 支持断点续传和分批保存。
+
+        两阶段流水线：先纯规则解析全部文件（零 LLM 成本），再可选 LLM 批量补漏，
+        最后统一构建图谱并落盘。断点续传语义保持：仍以"已 build 完"为准标记进度。
+        """
         import glob
-        
+
         # 检查是否要恢复之前的进度
         progress_data = {}
         if resume:
@@ -932,7 +1026,7 @@ class RecipeKnowledgeGraphBuilder:
             if progress_data:
                 processed_count = progress_data.get("processed_count", 0)
                 print(f"检测到未完成任务，已处理: {processed_count} 个菜谱")
-                
+
                 confirm = input("\n是否继续之前的处理? (Y/n): ").strip().lower()
                 if confirm == 'n':
                     print("重新开始处理...")
@@ -944,7 +1038,7 @@ class RecipeKnowledgeGraphBuilder:
                         os.remove(self.progress_file)
                 else:
                     print("继续之前的处理...")
-        
+
         # 专门扫描dishes目录
         dishes_dir = os.path.join(recipe_dir, "dishes")
         if not os.path.exists(dishes_dir):
@@ -953,72 +1047,88 @@ class RecipeKnowledgeGraphBuilder:
             print(f"未找到dishes目录，扫描整个目录: {recipe_dir}")
         else:
             print(f"扫描菜谱目录: {dishes_dir}")
-        
+
         recipe_files = glob.glob(os.path.join(dishes_dir, "**/*.md"), recursive=True)
-        
+
         # 过滤排除的目录
         filtered_files = []
         for recipe_file in recipe_files:
             relative_path = os.path.relpath(recipe_file, recipe_dir)
             path_parts = relative_path.replace('\\', '/').split('/')
-            
+
             # 检查是否包含排除的目录
             if any(excluded in path_parts for excluded in self.ai_agent.excluded_directories):
                 continue
-                
+
             filtered_files.append(recipe_file)
-        
+
         recipe_files = filtered_files
-        
+
         # 过滤掉已处理的文件
         remaining_files = []
         for recipe_file in recipe_files:
             relative_path = os.path.relpath(recipe_file, recipe_dir)
             if relative_path not in self.processed_files:
                 remaining_files.append(recipe_file)
-        
+
         total_files = len(recipe_files)
         remaining_count = len(remaining_files)
         already_processed = len(self.processed_files)
-        
+
         print(f"📊 文件统计:")
         print(f"   - 总文件数: {total_files}")
         print(f"   - 已处理: {already_processed}")
         print(f"   - 待处理: {remaining_count}")
-        
+
         if remaining_count == 0:
             print("✅ 所有文件都已处理完成!")
             return already_processed, 0
-        
-        processed_count = already_processed
+
+        # ---- 阶段一：纯规则解析全部文件（零 LLM 成本）----
+        parsed_items = []  # (recipe_info, relative_path, recipe_file)
         failed_count = 0
+        for recipe_file in remaining_files:
+            try:
+                with open(recipe_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                relative_path = os.path.relpath(recipe_file, recipe_dir)
+                recipe_info = self.ai_agent.extract_recipe_info_rule(content, relative_path)
+                parsed_items.append((recipe_info, relative_path, recipe_file))
+            except Exception as e:
+                failed_count += 1
+                print(f"❌ 解析失败: {recipe_file} - {str(e)}")
+
+        # ---- 阶段二：可选 LLM 批量补漏 ----
+        if self.use_llm and parsed_items:
+            print(f"🤖 LLM 批量补漏（llm_batch_size={self.llm_batch_size}）...")
+            for start in range(0, len(parsed_items), self.llm_batch_size):
+                chunk = parsed_items[start:start + self.llm_batch_size]
+                self.ai_agent.refine_recipe_info_batch([item[0] for item in chunk])
+            print(f"LLM 补漏完成，共 {len(parsed_items)} 份")
+
+        # ---- 阶段三：构建图谱 + 断点续传 ----
+        processed_count = already_processed
         current_batch_count = 0
-        
+
         try:
-            for i, recipe_file in enumerate(remaining_files):
+            for recipe_info, relative_path, recipe_file in parsed_items:
                 try:
-                    with open(recipe_file, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    
-                    relative_path = os.path.relpath(recipe_file, recipe_dir)
-                    
-                    # 处理菜谱
-                    self.process_recipe(content, relative_path)
-                    
+                    self.build_graph(recipe_info, relative_path)
+
                     # 标记为已处理
                     self.processed_files.add(relative_path)
                     processed_count += 1
                     current_batch_count += 1
-                    
+
                     # 简化进度显示
                     if processed_count % 20 == 0:
                         progress = (processed_count / total_files) * 100
                         print(f"进度: {processed_count}/{total_files} ({progress:.1f}%)")
-                    
+
                     # 保存进度（每处理5个文件保存一次进度）
                     if processed_count % 5 == 0:
                         self.save_progress(relative_path, total_files, processed_count)
-                    
+
                     # 检查是否需要保存批次
                     if current_batch_count >= self.batch_size:
                         self.save_batch_data()
@@ -1028,21 +1138,21 @@ class RecipeKnowledgeGraphBuilder:
                         self.relationships.clear()
                         self.current_batch += 1
                         current_batch_count = 0
-                        
+
                 except Exception as e:
                     failed_count += 1
-                    print(f"❌ 处理失败: {recipe_file} - {str(e)}")
+                    print(f"❌ 构建失败: {recipe_file} - {str(e)}")
                     continue
-            
+
             # 保存最后一个批次（如果有数据）
             if current_batch_count > 0:
                 self.save_batch_data()
-            
+
             # 最终保存进度
             self.save_progress("COMPLETED", total_files, processed_count)
-            
+
             print(f"处理完成: 成功 {processed_count - already_processed} 个，失败 {failed_count} 个")
-            
+
         except KeyboardInterrupt:
             print(f"用户中断，已保存进度: {processed_count}/{total_files}")
 
@@ -1052,7 +1162,7 @@ class RecipeKnowledgeGraphBuilder:
 
             # 保存进度
             self.save_progress("INTERRUPTED", total_files, processed_count)
-            
+
         return processed_count, failed_count
     
     def export_to_csv(self, output_dir: str):

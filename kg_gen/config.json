@@ -8,6 +8,8 @@
   },
   "processing": {
     "batch_size": 10,
+    "use_llm": true,
+    "llm_batch_size": 8,
     "delay_between_requests": 1,
     "max_concurrent_requests": 5
   },
